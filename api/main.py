@@ -1,25 +1,14 @@
 import os
 import numpy as np
-import tensorflow as tf
+import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from tensorflow.keras.models import Model  # type: ignore
-from tensorflow.keras.layers import Input, Dense, Lambda  # type: ignore
-from tensorflow.keras.optimizers import Adam  # type: ignore
-from tensorflow.keras.utils import register_keras_serializable  # type: ignore
 
-# Disable oneDNN optimizations for potential compatibility issues
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-@register_keras_serializable()
-def _combine_streams(inputs):
-    val, adv = inputs
-    return val + (adv - tf.reduce_mean(adv, axis=1, keepdims=True))
-
+# Initialize FastAPI app
 app = FastAPI()
 
-# Enable CORS (Cross-Origin Resource Sharing) to allow requests from any domain
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,50 +17,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Define file paths - locally and on PythonAnywhere
-weights_path = os.environ.get(
-    'MODEL_WEIGHTS_PATH',
-    '/home/Rdhirschel/mysite/public/assets/mancala_agent_final.weights.h5'
-    if 'VERCEL_ENV' in os.environ
-    else 'public/assets/mancala_agent_final.weights.h5'
-)
+# Path to the ONNX model file (you can convert your TFLite model to ONNX)
+onnx_model_path = os.environ.get("MODEL_PATH", "public/assets/mancala_agent_final.onnx")
 
-# Manually rebuild the model architecture to make the loading process in the pythonanwhere server work
-def build_model(lr=0.001, state_size=15, action_size=6):
-    """Builds a dueling DQN model for Q-learning."""
-    input_layer = Input(shape=(state_size,))
-    
-    x = Dense(512, activation='relu6', kernel_initializer='he_uniform')(input_layer)
-    x = Dense(256, activation='relu6', kernel_initializer='he_uniform')(x)
-    common = Dense(128, activation='relu6', kernel_initializer='he_uniform')(x)
-    
-    # Value stream
-    value_fc = Dense(64, activation='relu6', kernel_initializer='he_uniform')(common)
-    value_fc = Dense(32, activation='relu6', kernel_initializer='he_uniform')(value_fc)
-    value_fc = Dense(16, activation='relu6', kernel_initializer='he_uniform')(value_fc)
-    value = Dense(1, activation='linear', kernel_initializer='he_uniform')(value_fc)
-    
-    # Advantage stream
-    adv_fc = Dense(64, activation='relu6', kernel_initializer='he_uniform')(common)
-    adv_fc = Dense(32, activation='relu6', kernel_initializer='he_uniform')(adv_fc)
-    advantage = Dense(action_size, activation='linear', kernel_initializer='he_uniform')(adv_fc)
-    
-    # Combine the streams
-    q_values = Lambda(_combine_streams)([value, advantage])
-    model = Model(inputs=input_layer, outputs=q_values)
-    model.compile(optimizer=Adam(learning_rate=lr), loss='huber')
-    return model
-
-
-# Create model and load weights
-agent = build_model()
+# Initialize ONNX Runtime session
 try:
-    agent.load_weights(weights_path)
-    print("Model weights loaded successfully.")
+    session = ort.InferenceSession(onnx_model_path)
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
 except Exception as e:
-    print("Error loading model weights:", e)
-    raise RuntimeError("Failed to load model weights") from e
+    print(f"Error loading ONNX model: {e}")
 
+# Define the pydantic model for incoming board state
 class BoardState(BaseModel):
     state: list
 
@@ -79,22 +36,32 @@ class BoardState(BaseModel):
 def read_root():
     return {"message": "Mancala Agent API"}
 
+def predict_onnx(state: np.ndarray) -> np.ndarray:
+    """Perform inference using ONNX Runtime."""
+    outputs = session.run([output_name], {input_name: state.astype(np.float32)})
+    return outputs[0]
+
 @app.post("/best_move/")
 def get_best_move(board_state: BoardState):
+    # Validate board shape
     if len(board_state.state) != 15:
         raise HTTPException(status_code=400, detail="Input shape must be (15,)")
-
-    # Switch board positions between player 0 and 1
+    
+    # Switch board positions between player 0 and player 1 if needed
     if board_state.state[-1] == 0:
         for i in range(7):
             board_state.state[i], board_state.state[i + 7] = board_state.state[i + 7], board_state.state[i]
-
+    
     try:
-        state = np.array(board_state.state).reshape(1, -1)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
-
-    act_values = agent.predict(state, verbose=0)
-    best_moves = np.argsort(act_values[0])[::-1].tolist()
-
-    return {"best_moves": best_moves}
+        # Reshape input into a 2D array
+        state_array = np.array(board_state.state).reshape(1, -1)
+        
+        # Run inference
+        act_values = predict_onnx(state_array)
+        
+        # Get best moves by sorting output predictions
+        best_moves = np.argsort(act_values[0])[::-1].tolist()
+        
+        return {"best_moves": best_moves}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
