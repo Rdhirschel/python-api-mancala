@@ -17,11 +17,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Path to the ONNX model file (you can convert your TFLite model to ONNX)
+# Path to the ONNX model file
 onnx_model_path = os.environ.get("MODEL_PATH", "public/assets/mancala_agent_final.onnx")
 
 # Initialize ONNX Runtime session
 try:
+    # Load the ONNX model and get input/output names
+    # Why name is needed is because ONNX model can have multiple inputs and outputs. The output result from .run() is a list of output tensors.
+    # In our case, we only have 1 input tensor and 1 output tensor, so we can just get the first element of the list.
     session = ort.InferenceSession(onnx_model_path)
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
@@ -39,7 +42,7 @@ def read_root():
 def predict_onnx(state: np.ndarray) -> np.ndarray:
     """Perform inference using ONNX Runtime."""
     outputs = session.run([output_name], {input_name: state.astype(np.float32)})
-    return outputs[0]
+    return outputs[0] # outputs is a list of output tensors, we only have 1 output tensor which is act_values ([1, 6])
 
 @app.post("/best_move/")
 def get_best_move(board_state: BoardState):
