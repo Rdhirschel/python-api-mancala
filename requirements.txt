@@ -1,5 +1,5 @@
 fastapi==0.95.2
 uvicorn==0.22.0
 onnxruntime==1.18.0
-numpy
+numpy==2.0.0
 pydantic
